@@ -71,13 +71,14 @@ class HookInit : IXposedHookLoadPackage {
                 "com.pvr.shortcut.dock.datamanager.FixAppDataManager",
                 lpparam.classLoader,
                 "addRemoveFitCenterApp",
-                // MUST pass the exact parameter types here, otherwise Vector resolves
-                // addRemoveFitCenterApp() (zero-arg) and fails with #exact mismatch.
                 java.util.List::class.java,
                 java.util.List::class.java,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (!fitCenterEnabledInJson()) {
+                        if (fitCenterEnabledInJson()) {
+                            XposedBridge.log("PicoDockShortcut: Fit Center enabled, allowing addRemoveFitCenterApp")
+                        } else {
+                            XposedBridge.log("PicoDockShortcut: Blocking addRemoveFitCenterApp (remove Fit Center)")
                             param.result = null
                         }
                     }
@@ -392,24 +393,6 @@ class HookInit : IXposedHookLoadPackage {
             }
         }
         return null
-    }
-
-    // True when the user wants the Fit Center shown, i.e. the JSON contains an entry
-    // with packageName == com.pvr.fitcenter OR "fitCenter": true.
-    private fun fitCenterEnabledInJson(): Boolean {
-        return try {
-            val file = File(jsonPath)
-            if (!file.exists() || !file.canRead()) return false
-            val json = org.json.JSONArray(file.readText())
-            for (i in 0 until json.length()) {
-                val o = json.getJSONObject(i)
-                if (o.optBoolean("fitCenter", false)) return true
-                if (o.optString("packageName") == "com.pvr.fitcenter") return true
-            }
-            false
-        } catch (e: Exception) {
-            false
-        }
     }
 
     private fun drawableToBitmap(drawable: Drawable): Bitmap {

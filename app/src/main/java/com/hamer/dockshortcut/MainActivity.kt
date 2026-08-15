@@ -98,8 +98,10 @@ private object Shell {
     // ShortcutService is a bound service (only shows up in dumpsys when a client
     // binds it), so it is NOT a reliable “app is running” signal. Instead, detect
     // that the target Dock process is actually alive.
-    fun isTargetRunning(): Boolean =
-        exec("ps -A -o NAME | grep $TARGET_PACKAGE").contains(TARGET_PACKAGE)
+    fun isTargetRunning(): Boolean {
+        val result = exec("ps -A -o NAME | grep $TARGET_PACKAGE")
+        return result.contains(TARGET_PACKAGE) || result.contains("$TARGET_PACKAGE:") || result.contains("$TARGET_PACKAGE ")
+    }
 }
 // --- ViewModel ---
 
@@ -130,24 +132,16 @@ class MainViewModel : ViewModel() {
             // emitted exactly when the module really injected into the target on boot/spawn.
             // We pick the newest verbose_*.log with a plain glob (no command substitution)
             // to avoid timestamp churn when the log rotates on reboot.
-            val cmd = """
-                id
-                # running = target process alive
-                if ps -A -o NAME 2>/dev/null | grep -q "$TARGET_PACKAGE"; then
-                    echo "TARGET_RUNNING"
-                fi
-                # hooked = actual injection trace in newest verbose log
-                newest=${'$'}(ls -t /data/adb/lspd/log/verbose_*.log 2>/dev/null | head -1)
-                if [ -n "${'$'}newest" ] && grep -q "Hooking $TARGET_PACKAGE" "${'$'}newest" 2>/dev/null; then
-                    echo "HOOKED_OK"
-                fi
-            """.trimIndent()
-            
-            val result = Shell.exec(cmd)
-            
-            val rootOk = result.contains("uid=0")
-            val runningOk = result.contains("TARGET_RUNNING")
-            val hookedOk = result.contains("HOOKED_OK")
+            val rootOk = Shell.exec("id").contains("uid=0")
+            val runningOk = Shell.isTargetRunning()
+            val hookedOk = try {
+                Shell.exec(
+                    "newest=\$(ls -t /data/adb/lspd/log/verbose_*.log 2>/dev/null | head -1); " +
+                        "[ -n \"\$newest\" ] && grep -q \"Hooking $TARGET_PACKAGE\" \"\$newest\" 2>/dev/null && echo HOOKED_OK"
+                ).contains("HOOKED_OK")
+            } catch (_: Exception) {
+                false
+            }
 
             withContext(Dispatchers.Main) {
                 isModuleActive = isActive
@@ -209,7 +203,7 @@ class MainViewModel : ViewModel() {
                         appInfo.copy(
                             actionName = if (obj.has("actionName")) obj.getString("actionName") else null,
                             className = if (obj.has("className")) obj.getString("className") else appInfo.className,
-                            fitCenter = isFitCenterJson || pkg == FIT_CENTER_PACKAGE,
+                            fitCenter = obj.optBoolean("fitCenter", false) || pkg == FIT_CENTER_PACKAGE,
                             iconUrl = if (obj.has("iconUrl")) obj.getString("iconUrl") else null
                         )
                     )
@@ -679,7 +673,7 @@ private fun DockBgSection(viewModel: MainViewModel, context: Context) {
                     icon = Icons.Default.Check,
                     containerColor = Color(0xFF2E7D32),
                     disabled = bgInfo.isNullOrBlank()
-                ) { viewModel.applyChanges(context) }
+                ) { viewModel.applyChanges(context, false) }
             }
         }
     }
@@ -958,7 +952,7 @@ private fun readBgInfo(context: Context): String? {
 }
 
 @Composable
-private fun Header(viewModel: MainViewModel, context: Context) {
+private fun Header(viewModel: MainViewModel, context: Context, onLanguageClick: () -> Unit = {}) {
     var iconTapCount by remember { mutableIntStateOf(0) }
     
     Row(
@@ -1494,31 +1488,6 @@ fun AppPicker(
                     contentPadding = PaddingValues(bottom = 32.dp)
                 ) {
                     items(filteredAll) { app ->
-                        val interaction = remember { MutableInteractionSource() }
-                        val isHovered by interaction.collectIsHoveredAsState()
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .background(
-                                    if (isHovered) MaterialTheme.colorScheme.primaryContainer.copy(
-                                        alpha = 0.2f
-                                    ) else Color.Transparent
-                                )
-                                .hoverable(interaction)
-                                .clickable { onAppSelected(app) }
-                                .padding(horizontal = 24.dp, vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            AppIcon(app, 48.dp)
-                            Spacer(modifier = Modifier.width(16.dp))
-                            Text(
-                                app.label,
-                                style = MaterialTheme.typography.bodyLarge,
-                                color = Color.White
-                            )
-                        }
-                    }
-                    items(filtered) { app ->
                         AppPickerItem(app = app, onAppSelected = onAppSelected)
                     }
                 }
