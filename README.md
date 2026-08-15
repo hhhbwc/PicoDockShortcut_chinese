@@ -6,7 +6,7 @@
 </div>
 
 ## 👓 Screenshot
-<image src="Resource/Android_Pico2Dock.jpeg" width="400"/>
+<image src="Resource/NEW_Android_Pico2Dock.jpeg" width="800"/>
   
 ## 🌟 Key Features
 *   **🤌 Drag to Reorder:** Easily organize your dock shortcuts with intuitive long-press and drag gestures.
