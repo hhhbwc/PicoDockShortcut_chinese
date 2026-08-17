@@ -23,6 +23,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.DataOutputStream
 import java.io.File
+import java.io.FileOutputStream
 
 // --- Constants & Shell Utils ---
 
@@ -90,6 +91,7 @@ class MainViewModel : ViewModel() {
     var isRetrying by mutableStateOf(false)
     var isModuleActive by mutableStateOf(true)
     var isTargetHooked by mutableStateOf(true)
+    var isTargetRunning by mutableStateOf(true)
     var hasRoot by mutableStateOf(true)
     var bgPendingRestore by mutableStateOf(false)
     var bgModified by mutableStateOf(false)
@@ -133,11 +135,13 @@ class MainViewModel : ViewModel() {
             val result = Shell.exec(cmd)
 
             val rootOk = result.contains("uid=0")
+            val runningOk = result.contains("TARGET_RUNNING")
             val hookedOk = result.contains("HOOKED_OK")
 
             withContext(Dispatchers.Main) {
                 isModuleActive = isActive
                 hasRoot = rootOk
+                isTargetRunning = runningOk
                 isTargetHooked = hookedOk
             }
         }
@@ -204,8 +208,9 @@ class MainViewModel : ViewModel() {
             val file = getJsonFile(context)
             val content = if (file.exists()) file.readText() else {
                 val default = getDefaultJsonFromTarget(context)
-                file.writeText(default)
-                file.setReadable(true, false)
+                if (!writeJsonAtomically(file, default)) {
+                    throw IllegalStateException("could not initialize Dock configuration")
+                }
                 context.filesDir.parentFile?.setExecutable(true, false)
                 default
             }
@@ -398,12 +403,28 @@ class MainViewModel : ViewModel() {
                 put("iconUrl", "Image/ic_appmanager.png")
             })
         }
-        getJsonFile(context).apply {
-            writeText(jsonArray.toString(2))
-            setReadable(true, false)
+        if (!writeJsonAtomically(getJsonFile(context), jsonArray.toString(2))) {
+            throw IllegalStateException("could not persist Dock configuration")
         }
 
         saveIconsToDisk(context)
+    }
+
+    private fun writeJsonAtomically(target: File, content: String): Boolean {
+        return try {
+            JSONArray(content)
+            val temp = File(target.parentFile, "${target.name}.tmp")
+            FileOutputStream(temp).use { output ->
+                output.write(content.toByteArray(Charsets.UTF_8))
+                output.fd.sync()
+            }
+            if (!temp.renameTo(target)) return false
+            target.setReadable(true, false)
+            JSONArray(target.readText())
+            true
+        } catch (e: Exception) {
+            false
+        }
     }
 
     private fun saveIconsToDisk(context: Context) {
@@ -537,55 +558,20 @@ class MainViewModel : ViewModel() {
     }
 
     private suspend fun restartTargetApp(context: Context) = withContext(Dispatchers.IO) {
-        try {
-            Shell.exec("am force-stop $TARGET_PACKAGE")
-            Shell.exec("am startservice -a $TARGET_ACTION -n $TARGET_PACKAGE/$TARGET_SERVICE")
+        val config = getJsonFile(context)
+        if (!config.exists()) throw IllegalStateException("Dock configuration is missing")
+        JSONArray(config.readText())
 
-            var processStarted = false
-            var serviceStarted = false
-
-            // Wait for package process first
-            repeat(10) {
-                if (Shell.isProcessRunning()) {
-                    processStarted = true
-                    return@repeat
-                }
-                delay(1000)
-            }
-
-            // Wait for specific service
-            if (processStarted) {
-                repeat(10) {
-                    if (Shell.isServiceRunning()) {
-                        serviceStarted = true
-                        return@repeat
-                    }
-                    delay(1000)
-                }
-            }
-
-            withContext(Dispatchers.Main) {
-                val msg = when {
-                    serviceStarted -> context.getString(R.string.toast_applied_active)
-                    processStarted -> context.getString(R.string.toast_applied_slow)
-                    else -> context.getString(R.string.toast_applied_timeout)
-                }
-                Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
-            }
-        } catch (e: Exception) {
-            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-            am.killBackgroundProcesses(TARGET_PACKAGE)
-            context.packageManager.getLaunchIntentForPackage(TARGET_PACKAGE)?.let { intent ->
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                withContext(Dispatchers.Main) {
-                    context.startActivity(intent)
-                    Toast.makeText(
-                        context,
-                        context.getString(R.string.toast_applied_fallback),
-                        Toast.LENGTH_SHORT
-                    ).show()
-                }
-            }
+        Shell.exec(
+            "settings put global pico_systemext_coord_dock_generation $(date +%s); " +
+                "am force-stop $TARGET_PACKAGE"
+        )
+        withContext(Dispatchers.Main) {
+            Toast.makeText(
+                context,
+                "Changes applied. Open Dock again after a few seconds.",
+                Toast.LENGTH_LONG
+            ).show()
         }
     }
 }

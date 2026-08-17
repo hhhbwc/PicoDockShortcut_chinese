@@ -73,397 +73,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.DataOutputStream
 import java.io.File
-
-// --- Constants & Shell Utils ---
-
-private const val JSON_FILE_NAME = "dock_fix_apps.json"
-private const val TARGET_PACKAGE = "com.pvr.shortcut"
-
-private object Shell {
-    fun exec(command: String): String = try {
-        val process = Runtime.getRuntime().exec("su")
-        DataOutputStream(process.outputStream).use { os ->
-            os.writeBytes("$command\n")
-            os.writeBytes("exit\n")
-            os.flush()
-        }
-        val output = process.inputStream.bufferedReader().readText()
-        val error = process.errorStream.bufferedReader().readText()
-        process.waitFor()
-        output + error
-    } catch (e: Exception) {
-        ""
-    }
-
-    // ShortcutService is a bound service (only shows up in dumpsys when a client
-    // binds it), so it is NOT a reliable “app is running�?signal. Instead, detect
-    // that the target Dock process is actually alive.
-    fun isTargetRunning(): Boolean {
-        val result = exec("ps -A -o NAME | grep $TARGET_PACKAGE")
-        return result.contains(TARGET_PACKAGE) || result.contains("$TARGET_PACKAGE:") || result.contains("$TARGET_PACKAGE ")
-    }
-}
-// --- ViewModel ---
-
-class MainViewModel : ViewModel() {
-    val selectedApps = mutableStateListOf<AppInfo>()
-    private val savedApps = mutableListOf<AppInfo>()
-    
-    val isModified by derivedStateOf {
-        selectedApps.size != savedApps.size || selectedApps.indices.any { i ->
-            !selectedApps[i].isSameAs(savedApps[i])
-        }
-    }
-
-    var isApplying by mutableStateOf(false)
-    var isRetrying by mutableStateOf(false)
-    var isModuleActive by mutableStateOf(true)
-    var isTargetHooked by mutableStateOf(true)
-    var isTargetRunning by mutableStateOf(true)
-    var hasRoot by mutableStateOf(true)
-
-    fun checkStatus() {
-        viewModelScope.launch(Dispatchers.IO) {
-            val isActive = XposedStatus.isActive()
-            // Reliable hook detection: Vector/agent injects the module hook classes but the
-            // APK path does NOT appear in the target process maps, so grepping maps for
-            // "com.hamer.dockshortcut" gives false negatives. Instead we grep the newest
-            // LSPosed verbose log for an actual "Hooking com.pvr.shortcut" trace, which is
-            // emitted exactly when the module really injected into the target on boot/spawn.
-            // We pick the newest verbose_*.log with a plain glob (no command substitution)
-            // to avoid timestamp churn when the log rotates on reboot.
-            val rootOk = Shell.exec("id").contains("uid=0")
-            val runningOk = Shell.isTargetRunning()
-            val hookedOk = try {
-                Shell.exec(
-                    "newest=\$(ls -t /data/adb/lspd/log/verbose_*.log 2>/dev/null | head -1); " +
-                        "[ -n \"\$newest\" ] && grep -q \"Hooking $TARGET_PACKAGE\" \"\$newest\" 2>/dev/null && echo HOOKED_OK"
-                ).contains("HOOKED_OK")
-            } catch (_: Exception) {
-                false
-            }
-
-            withContext(Dispatchers.Main) {
-                isModuleActive = isActive
-                hasRoot = rootOk
-                isTargetRunning = runningOk
-                isTargetHooked = hookedOk
-            }
-        }
-    }
-
-    private fun getJsonFile(context: Context) = File(context.filesDir.parentFile, JSON_FILE_NAME)
-
-    fun loadApps(context: Context) {
-        viewModelScope.launch(Dispatchers.IO) {
-            val file = getJsonFile(context)
-            val content = if (file.exists()) file.readText() else {
-                val default = try {
-                    context.assets.open(JSON_FILE_NAME).bufferedReader().use { it.readText() }
-                } catch (e: Exception) {
-                    "[]"
-                }
-                file.writeText(default)
-                file.setReadable(true, false)
-                context.filesDir.parentFile?.setExecutable(true, false)
-                default
-            }
-            parseApps(context, content, updateSaved = true)
-        }
-    }
-
-    private suspend fun parseApps(context: Context, content: String, updateSaved: Boolean) = withContext(Dispatchers.IO) {
-        try {
-            val jsonArray = JSONArray(content)
-            val tempApps = mutableListOf<AppInfo>()
-
-            for (i in 0 until jsonArray.length()) {
-                val obj = jsonArray.getJSONObject(i)
-                val pkg = obj.optString("packageName")
-                if (pkg == "com.pvr.appmanager") continue
-
-                // 运动中心特殊条目:不走 AppManager, 用合�?AppInfo 展示
-                if (obj.optBoolean("fitCenter", false) || pkg == FIT_CENTER_PACKAGE) {
-                    tempApps.add(
-                        AppInfo(
-                            packageName = FIT_CENTER_PACKAGE,
-                            className = FIT_CENTER_CLASS,
-                            label = FIT_CENTER_LABEL,
-                            fitCenter = true,
-                            iconUrl = obj.optString("iconUrl").ifEmpty { "Image/custom_icon_${FIT_CENTER_PACKAGE}.png" }
-                        )
-                    )
-                    if (tempApps.size >= 11) break
-                    continue
-                }
-
-                val appInfo = AppManager.getAppInfo(context, pkg)
-                if (appInfo != null) {
-                    tempApps.add(
-                        appInfo.copy(
-                            actionName = if (obj.has("actionName")) obj.getString("actionName") else null,
-                            className = if (obj.has("className")) obj.getString("className") else appInfo.className,
-                            fitCenter = obj.optBoolean("fitCenter", false) || pkg == FIT_CENTER_PACKAGE,
-                            iconUrl = if (obj.has("iconUrl")) obj.getString("iconUrl") else null
-                        )
-                    )
-                } else if (pkg == "com.hamer.debug") {
-                    tempApps.add(AppInfo(pkg, null, context.getString(R.string.debug_app_label), null))
-                }
-                if (tempApps.size >= 11) break
-            }
-
-            if (tempApps.isEmpty()) tempApps.add(
-                AppInfo(
-                    "com.hamer.debug",
-                    null,
-                    context.getString(R.string.debug_app_label),
-                    null
-                )
-            )
-
-            withContext(Dispatchers.Main) {
-                selectedApps.clear()
-                selectedApps.addAll(tempApps)
-                if (updateSaved) {
-                    savedApps.clear()
-                    savedApps.addAll(tempApps)
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-    }
-
-    fun reload(context: Context) {
-        viewModelScope.launch {
-            val file = getJsonFile(context)
-            if (file.exists()) parseApps(context, file.readText(), updateSaved = true)
-        }
-    }
-
-    fun restoreDefault(context: Context) {
-        viewModelScope.launch {
-            val default = try {
-                context.assets.open(JSON_FILE_NAME).bufferedReader().use { it.readText() }
-            } catch (e: Exception) {
-                "[]"
-            }
-            parseApps(context, default, updateSaved = false)
-
-        }
-    }
-
-    private fun clearIconCache(context: Context) {
-        val imageDir = File(context.filesDir.parentFile, "Image")
-        if (imageDir.exists()) {
-            imageDir.listFiles()?.filter { it.isFile }?.forEach { it.delete() }
-        }
-    }
-
-    fun addApp(app: AppInfo) {
-        if (selectedApps.size < 11) selectedApps.add(app)
-    }
-
-    fun removeApp(context: Context, index: Int) {
-        if (index in selectedApps.indices) {
-            val app = selectedApps[index]
-            // Delete custom icon if exists
-            val customFile = File(context.filesDir.parentFile, "Image/Custom/custom_icon_${app.packageName}.png")
-            if (customFile.exists()) {
-                customFile.delete()
-            }
-            selectedApps.removeAt(index)
-        }
-    }
-
-    fun moveApp(from: Int, to: Int) {
-        if (from == to || from !in selectedApps.indices || to !in selectedApps.indices) return
-        val item = selectedApps.removeAt(from)
-        selectedApps.add(to, item)
-    }
-
-    fun saveCustomIcon(context: Context, uri: Uri, packageName: String) {
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val inputStream = context.contentResolver.openInputStream(uri)
-                val originalBitmap = BitmapFactory.decodeStream(inputStream)
-                inputStream?.close()
-
-                if (originalBitmap != null) {
-                    // Process ratio handler
-                    val drawable = BitmapDrawable(context.resources, originalBitmap)
-                    val processedBitmap = drawableToBitmap(drawable)
-
-                    val imageDir = File(context.filesDir.parentFile, "Image/Custom")
-                    if (!imageDir.exists()) {
-                        imageDir.mkdirs()
-                    }
-                    imageDir.setReadable(true, false)
-                    imageDir.setExecutable(true, false)
-
-                    val iconFile = File(imageDir, "custom_icon_$packageName.png")
-                    iconFile.outputStream().use {
-                        processedBitmap.compress(Bitmap.CompressFormat.PNG, 100, it)
-                    }
-                    iconFile.setReadable(true, false)
-
-                    withContext(Dispatchers.Main) {
-                        val index = selectedApps.indexOfFirst { it.packageName == packageName }
-                        if (index != -1) {
-                            val app = selectedApps[index]
-                            selectedApps[index] = app.copy(iconUrl = "Image/Custom/custom_icon_$packageName.png?t=${System.currentTimeMillis()}")
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-        }
-    }
-
-    private fun saveToJson(context: Context) {
-        val jsonArray = JSONArray().apply {
-            selectedApps.forEach { app ->
-                val item = JSONObject().apply {
-                    put("packageName", if (isFitCenter(app)) FIT_CENTER_PACKAGE else app.packageName)
-                    app.className?.let { put("className", if (isFitCenter(app)) FIT_CENTER_CLASS else it) }
-                    app.actionName?.let { put("actionName", it) }
-                    if (isFitCenter(app)) {
-                        put("fitCenter", true)
-                    }
-                    put("iconUrl", app.iconUrl ?: if (isFitCenter(app)) "Image/custom_icon_${FIT_CENTER_PACKAGE}.png" else "Image/custom_icon_${app.packageName}.png")
-                }
-                put(item)
-            }
-            put(JSONObject().apply {
-                put("packageName", "com.pvr.appmanager")
-                put("className", "com.pvr.appmanager.AllAppActivity")
-                put("iconUrl", "Image/ic_appmanager.png")
-            })
-        }
-        getJsonFile(context).apply {
-            writeText(jsonArray.toString(2))
-            setReadable(true, false)
-        }
-        
-        saveIconsToDisk(context)
-    }
-
-    private fun saveIconsToDisk(context: Context) {
-        val imageDir = File(context.filesDir.parentFile, "Image")
-        if (!imageDir.exists()) {
-            imageDir.mkdirs()
-        }
-        imageDir.setReadable(true, false)
-        imageDir.setExecutable(true, false)
-
-        selectedApps.forEach { app ->
-            if (isFitCenter(app)) return@forEach
-            val iconFile = File(imageDir, "custom_icon_${app.packageName}.png")
-            if (!iconFile.exists()) {
-                val drawable = AppManager.getAppIcon(context, app.packageName)
-                if (drawable != null) {
-                    val bitmap = drawableToBitmap(drawable)
-                    iconFile.outputStream().use {
-                        bitmap.compress(Bitmap.CompressFormat.PNG, 100, it)
-                    }
-                    iconFile.setReadable(true, false)
-                }
-            }
-        }
-    }
-
-    private fun drawableToBitmap(drawable: Drawable): Bitmap {
-        val srcW = drawable.intrinsicWidth.coerceAtLeast(1)
-        val srcH = drawable.intrinsicHeight.coerceAtLeast(1)
-        val targetRatio = 152f / 128f
-        val srcRatio = srcW.toFloat() / srcH.toFloat()
-
-        val bitmapW: Int
-        val bitmapH: Int
-        if (srcRatio < targetRatio) {
-            bitmapH = srcH
-            bitmapW = (srcH * 152) / 128
-        } else {
-            bitmapW = srcW
-            bitmapH = (srcW * 128) / 152
-        }
-
-        val bitmap = Bitmap.createBitmap(bitmapW, bitmapH, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bitmap)
-        val left = (bitmapW - srcW) / 2
-        val top = (bitmapH - srcH) / 2
-        drawable.setBounds(left, top, left + srcW, top + srcH)
-        drawable.draw(canvas)
-        return bitmap
-    }
-
-    fun applyChanges(context: Context, checkStatus: Boolean) {
-        viewModelScope.launch {
-            isApplying = true
-            saveToJson(context)
-            clearIconCache(context)
-            savedApps.clear()
-            savedApps.addAll(selectedApps)
-            restartTargetApp(context)
-            if (checkStatus) {
-                delay(2000) // Give more time for the service to start and module to inject
-                checkStatus()
-            }
-            isApplying = false
-        }
-    }
-
-    fun restartAndRetry(context: Context) {
-        viewModelScope.launch {
-            isRetrying = true
-            if (!isModuleActive) {
-                restartSelf(context)
-            } else {
-                restartTargetApp(context)
-                delay(2000)
-                checkStatus()
-            }
-            isRetrying = false
-        }
-    }
-
-    private fun restartSelf(context: Context) {
-        val intent = context.packageManager.getLaunchIntentForPackage(context.packageName)
-        intent?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
-        context.startActivity(intent)
-        // Ensure the process is killed as requested in MainActivity.kt
-        android.os.Process.killProcess(android.os.Process.myPid())
-    }
-
-    private suspend fun restartTargetApp(context: Context) = withContext(Dispatchers.IO) {
-        try {
-            // force-stop the Dock so it re-reads dock_fix_apps.json on its next launch.
-            // We deliberately do NOT am-start the target: the Dock bar is a system VR
-            // panel owned by com.picovr.systemext, force-starting its MainActivity steals
-            // the window focus and hides the manager GUI. The config already reloads the
-            // next time the Dock is invoked; the user just calls it up with the controller.
-            Shell.exec("am force-stop $TARGET_PACKAGE")
-
-            withContext(Dispatchers.Main) {
-                Toast.makeText(
-                    context,
-                    "应用成功，按右手柄O呼出dock（约5秒后生效�?,
-                    Toast.LENGTH_LONG
-                ).show()
-            }
-        } catch (e: Exception) {
-            withContext(Dispatchers.Main) {
-                Toast.makeText(
-                    context,
-                    "应用成功，按右手柄O呼出dock（约5秒后生效�?,
-                    Toast.LENGTH_LONG
-                ).show()
-            }
-        }
-    }
-}
+import java.io.FileOutputStream
 
 // --- Main Activity ---
 
@@ -595,7 +205,8 @@ private fun DockBgSection(viewModel: MainViewModel, context: Context) {
     var bgInfo by remember { mutableStateOf(readBgInfo(context)) }
     var cropUri by remember { mutableStateOf<android.net.Uri?>(null) }
 
-    // Dock 条宽高比。高度固�? 宽度随应用数变化�?    // 裁剪按“上限比例�?11 个应用满�?出图, 左侧对齐; 应用少时右侧内容看不到�?    val barRatio = remember(viewModel.selectedApps.size, bgInfo) {
+    // Derive the visible Dock aspect from its active app count.
+    val barRatio = remember(viewModel.selectedApps.size, bgInfo) {
         dockBarAspect(context, viewModel.selectedApps.size)
     }
     val maxRatio = remember { DOCK_MAX_ASPECT }
@@ -620,9 +231,9 @@ private fun DockBgSection(viewModel: MainViewModel, context: Context) {
                     try { dst.setReadable(true, false) } catch (_: Throwable) {}
                     bgInfo = readBgInfo(context)
                     cropUri = null
-                    Toast.makeText(context, "背景已裁剪保�? $bgInfo", Toast.LENGTH_LONG).show()
+                    Toast.makeText(context, "Background saved: $bgInfo", Toast.LENGTH_LONG).show()
                 } catch (e: Exception) {
-                    Toast.makeText(context, "保存失败: ${e.message}", Toast.LENGTH_LONG).show()
+                    Toast.makeText(context, "Could not save background: ${e.message}", Toast.LENGTH_LONG).show()
                 }
             }
         )
@@ -641,19 +252,15 @@ private fun DockBgSection(viewModel: MainViewModel, context: Context) {
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                if (bgInfo.isNullOrBlank())
-                    "未设置背�?· 选图后可自己框选区�?
-                else "当前背景: $bgInfo",
+                if (bgInfo.isNullOrBlank()) "No background selected."
+                else "Current background: $bgInfo",
                 style = MaterialTheme.typography.bodySmall,
                 color = if (bgInfo.isNullOrBlank()) Color.Gray else Color(0xFF7EC8FF)
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                "Dock 高度固定(120dp)、宽度随图标数量变化。图片左侧对齐固�? " +
-                "图标越多右侧露出的画面越多。裁剪按系统硬上�?dock_max_width 1800dp " +
-                "(${"%.0f".format(maxRatio)} : 1)。当�?${viewModel.selectedApps.size} 个快捷应�?+ 资源�? +
-                ", 只能看到左边�?${(barRatio / maxRatio * 100).toInt()}%。打开应用(资源库右侧最�? +
-                "$MAX_RECENT_APPS 个最近应�?时会临时变宽, 露出更多�?,
+                "The Dock background uses a ${"%.0f".format(maxRatio)} : 1 crop. " +
+                    "Current visible width: ${(barRatio / maxRatio * 100).toInt()}%.",
                 style = MaterialTheme.typography.bodySmall,
                 color = Color.Gray
             )
@@ -721,6 +328,8 @@ private fun dockBarAspect(context: Context, appCount: Int): Float {
 // ---- 固定比例裁剪对话�? 拖动平移 + 滑杆缩放, 预览即结�?----
 // aspect        = 存图比例(上限, �?MAX_DOCK_APPS �?
 // visibleAspect = 当前应用数下实际可见的比�? 用于在框内画“当前可见边界�?@Composable
+
+@Composable
 private fun CropDialog(
     uri: android.net.Uri,
     aspect: Float,
@@ -783,21 +392,22 @@ private fun CropDialog(
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    "比例 ${"%.0f".format(aspect)} : 1 (Dock 硬上限宽�? · 原图 ${src.width}x${src.height}",
+                    "Aspect ${"%.0f".format(aspect)} : 1. Source: ${src.width}x${src.height}.",
                     style = MaterialTheme.typography.bodySmall,
                     color = Color.Gray
                 )
                 Spacer(modifier = Modifier.height(2.dp))
                 Text(
                     if (visibleAspect < aspect)
-                        "图片左侧对齐。当�?$appCount 个快捷应用只能看到蓝线左侧部�? 图标越多越往右露"
-                    else "图片左侧对齐, 图标越多右侧露出的画面越�?,
+                        "The blue line marks the current visible Dock area for $appCount apps."
+                    else "The full cropped background is visible.",
                     style = MaterialTheme.typography.bodySmall,
                     color = Color(0xFF7EC8FF)
                 )
                 Spacer(modifier = Modifier.height(16.dp))
 
-                // 裁剪�?固定比例), 内部直接�?src 矩形绘制 => 所见即所�?                Box(
+                // Keep the crop preview at the requested aspect ratio.
+                Box(
                     modifier = Modifier
                         .fillMaxWidth()
                         .aspectRatio(aspect)
@@ -865,7 +475,7 @@ private fun CropDialog(
                     Text("${"%.1f".format(zoom)}x", color = Color.LightGray)
                 }
                 Text(
-                    "拖动画面调整取景 · 滑杆放大可只截取局�?,
+                    "Drag to position the image and use the slider to zoom.",
                     style = MaterialTheme.typography.bodySmall,
                     color = Color.Gray
                 )
@@ -883,7 +493,7 @@ private fun CropDialog(
                         disabled = false
                     ) { onDismiss() }
                     ActionButton(
-                        text = "使用此区�?,
+                        text = "Use this crop",
                         icon = Icons.Default.Check,
                         containerColor = Color(0xFF2E7D32),
                         disabled = false
@@ -894,7 +504,8 @@ private fun CropDialog(
                             val cw = cropW.toInt().coerceIn(1, src.width - sx)
                             val ch = cropH.toInt().coerceIn(1, src.height - sy)
                             var out = android.graphics.Bitmap.createBitmap(src, sx, sy, cw, ch)
-                            // 输出�?Dock 条实际像素的 2 倍即�? 省内�?                            val targetH = 320
+                            // Keep the generated background within a bounded memory budget.
+                            val targetH = 320
                             if (out.height > targetH) {
                                 val targetW = (targetH * aspect).toInt().coerceAtLeast(1)
                                 out = android.graphics.Bitmap.createScaledBitmap(
@@ -940,7 +551,7 @@ private fun readBgInfo(context: Context): String? {
         if (bmp == null) "dock_bg.png (无法解析)"
         else "dock_bg.png · ${bmp.width}x${bmp.height}"
     } catch (e: Exception) {
-        "dock_bg.png (不可�?"
+        "dock_bg.png (unavailable)"
     }
 }
 
@@ -1589,7 +1200,7 @@ fun LanguageSelector(onDismiss: () -> Unit) {
         "Auto" to "",
         "English" to "en",
         "English (UK)" to "en-GB",
-        "简体中�? to "zh-CN",
+        "Chinese (Simplified)" to "zh-CN",
         "繁體中文 (台灣)" to "zh-TW",
         "繁體中文 (香港)" to "zh-HK",
         "Deutsch" to "de",
@@ -1597,10 +1208,10 @@ fun LanguageSelector(onDismiss: () -> Unit) {
         "Español" to "es",
         "Español (US)" to "es-US",
         "Italiano" to "it",
-        "日本�? to "ja",
-        "한국�? to "ko",
+        "Japanese" to "ja",
+        "Korean" to "ko",
         "Русский" to "ru",
-        "ไท�? to "th",
+        "Thai" to "th",
         "Türkçe" to "tr",
         "Čeština" to "cs",
         "Dansk" to "da",

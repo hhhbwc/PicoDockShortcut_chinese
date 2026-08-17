@@ -208,7 +208,8 @@ class HookInit : IXposedHookLoadPackage {
             val bmp = loadUserBitmap()
             if (bmp == null) XposedBridge.log("PicoDockShortcut: no dock_bg.png, using gradient placeholder")
 
-            // 1) Dock �?            val bar = findDockBar(root)
+            // Apply the user background to the Dock bar.
+            val bar = findDockBar(root)
             if (bar != null) {
                 val radii = radiiOf(bar)
                 bar.background = RoundedBgDrawable(bmp, radii) { w, h -> writeBarSize(w, h) }
@@ -230,9 +231,9 @@ class HookInit : IXposedHookLoadPackage {
         }
     }
 
-    // Dock 条原生圆�?px)。inflate 时若背景已被替换过读不到, 退回原生�?38�?    private val defaultCornerPx = 38f
+    private val defaultCornerPx = 38f
 
-    // Dock 条实际宽高上报给 GUI(裁剪框比例用)�?    // �?Settings.Global: com.pvr.shortcut �?uid 1000 可写, 模块 App 可读; 比写文件可靠�?    private val barSizeKey = "pico_dock_bar_size"
+    private val barSizeKey = "pico_dock_bar_size"
     private var lastBarSize: String? = null
     private var barCtx: android.content.Context? = null
 
@@ -344,7 +345,7 @@ class HookInit : IXposedHookLoadPackage {
             path.addRoundRect(android.graphics.RectF(0f, 0f, w, h), radii, android.graphics.Path.Direction.CW)
             paint.shader = if (bmp != null) {
                 // 左对�?+ 按高度等比缩�?
-                // 图片左侧固定, Dock 变窄时只截掉右侧; Dock 变宽时右侧露出更多画面�?                // 图宽不够时靠 CLAMP 用右边缘像素延展�?                val scale = h / bmp.height
+                val scale = h / bmp.height
                 val m = android.graphics.Matrix()
                 m.setScale(scale, scale)
                 val sh = android.graphics.BitmapShader(bmp,
