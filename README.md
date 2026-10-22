@@ -59,7 +59,7 @@ Dock 条本身在系统里是固定的纯色 `#FF1F1F1F`,本模块让你换成�
 **实现要点**:
 
 - hook `com.pvr.shortcut.service.ShortcutViewContainer.inflateRootView(Context)`,拿到 Dock 根视图后替换背景。
-- 目标视图定位:取 `dock_container`(`0x7f09009c`)下第一个 `id != 0x7f09005b` 的 `LinearLayout` 子节点 = 可见的 Dock 条;Guide(新手引导)= `0x7f09005b`,两者共用同一张 Bitmap、各自保留自己的圆角。
+- 目标视图定位:取 `dock_container`(`0x7f09009c`)下第一个 `id != 0x7f09005b` 的 `LinearLayout` 子节点 = 可见的 Dock 条;Guide(新手引导)= `0x7f09005b`,两者共用同一张 Bitmap,各自保留自己的圆角。
   - **不能直接改 `dock_container` 本身**——它是透明容器,给它上背景会把 Dock 条与 Guide 之间的透明空隙填满。
 - 自定义 **RoundedBgDrawable : Drawable**,在 **onBoundsChange()** 里按真实 bounds 建 **BitmapShader**(Matrix center-crop,不变形)+ **Path.addRoundRect** 圆角。
   - inflate 阶段 View 还没测量(**width/height == 0**),所以**不能**在 hook 里直接预渲染 Bitmap,必须等 bounds 回调。
